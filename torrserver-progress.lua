@@ -171,13 +171,18 @@ local function populate_playlist(current, hook)
             return ka < kb or (ka == kb and a.id < b.id)
         end)
         for position, file in ipairs(files) do
+            local filename = file.path:match('[^/\\]+$') or file.path
+            -- M3U titles are available before an episode has ever been opened.
+            local title = filename:gsub('[\r\n]', ' ')
             if file.id ~= current.index then
-                local filename = file.path:match('[^/\\]+$') or file.path
                 local url = current.origin .. '/stream/' .. url_encode(filename)
                     .. '?link=' .. current.hash .. '&index=' .. file.id .. '&play'
-                mp.commandv('loadfile', url, 'append')
+                mp.commandv('loadlist', 'memory://#EXTM3U\n#EXTINF:-1,' .. title
+                    .. '\n' .. url .. '\n', 'append')
                 -- Insert before/after the playing entry without reloading it.
                 mp.commandv('playlist-move', mp.get_property_number('playlist-count') - 1, position - 1)
+            else
+                mp.set_property('file-local-options/force-media-title', title)
             end
         end
         msg.info('TorrServer episodes added to the IINA playlist')

@@ -2,7 +2,7 @@
 
 Watch a torrent season in IINA, keep your preferred audio track, and send playback progress back to TorrServer for Lampa.
 
-- **Episodes in IINA:** open one episode; the torrent's video files appear in the native playlist, naturally sorted (2 before 10). Your current episode stays selected; existing playlists are preserved.
+- **Episodes in IINA:** open one episode; the torrent's video files appear in the native playlist, naturally sorted (2 before 10), with filenames visible before playback. Your current episode stays selected; existing playlists are preserved.
 - **Choose a voice once:** a manual audio selection is remembered per torrent, including after restart. Tracks are matched by title and language, with codec/channel tie-breaking, rather than unstable track numbers. Missing or ambiguous matches keep IINA's default.
 - **Progress back to Lampa:** saved every 15 seconds, on pause, stop and exit; reaching the end saves the full duration.
 - **One Lua file:** no Lampa changes, playlist export, cloud account or background service. Only explicitly configured server addresses receive requests.
