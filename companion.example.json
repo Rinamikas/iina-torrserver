@@ -1,0 +1,14 @@
+{
+  "torrserver": "http://127.0.0.1:8090",
+  "bind": "127.0.0.1",
+  "port": 8092,
+  "download_enabled": false,
+  "cleanup_watched": false,
+  "cleanup_expired": false,
+  "token": "REPLACE_WITH_A_RANDOM_TOKEN_OF_AT_LEAST_32_CHARACTERS",
+  "cache_dir": "~/Library/Caches/iina-torrserver",
+  "max_cache_bytes": 68719476736,
+  "min_free_bytes": 10737418240,
+  "retention_seconds": 604800,
+  "lease_seconds": 120
+}

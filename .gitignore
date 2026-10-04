@@ -1,3 +1,6 @@
 PROJECT_NOTES.md
 .DS_Store
 torrserver-audio.json*
+__pycache__/
+companion.json
+*.log
