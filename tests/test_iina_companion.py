@@ -208,8 +208,9 @@ def main():
             assert upstream.viewed[1] >= duration * .95
             command('stop')
             wait(lambda: not cache.active(HASH), 'IINA stop did not release its cache lease')
-            assert cache.cleanup() == [(HASH, 1)]
-            print('PASS: real IINA seek/pause/95%/stop -> progress and safe per-file cleanup', flush=True)
+            assert cache.cleanup() == []
+            assert cache.path(HASH, 1).exists()
+            print('PASS: real IINA seek/pause/95%/stop -> progress and retained current cache', flush=True)
             # A clean helper error before playback must retry the original stream once.
             upstream.ignore_range = True
             command('set', 'pause', 'no')

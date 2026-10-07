@@ -5,10 +5,12 @@
   "download_enabled": false,
   "cleanup_watched": false,
   "cleanup_expired": false,
+  "download_ahead": 3,
+  "keep_previous": 1,
   "token": "REPLACE_WITH_A_RANDOM_TOKEN_OF_AT_LEAST_32_CHARACTERS",
   "cache_dir": "~/Library/Caches/iina-torrserver",
   "max_cache_bytes": 68719476736,
   "min_free_bytes": 10737418240,
-  "retention_seconds": 604800,
+  "retention_seconds": 1209600,
   "lease_seconds": 120
 }

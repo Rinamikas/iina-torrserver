@@ -73,6 +73,11 @@ class Companion:
             if type(value) is not bool:
                 raise ValueError(name + ' must be a JSON boolean')
             setattr(self, name, value)
+        for name, default in (('download_ahead', 3), ('keep_previous', 1)):
+            value = config.get(name, default)
+            if type(value) is not int or value < 0:
+                raise ValueError(name + ' must be a nonnegative JSON integer')
+            setattr(self, name, value)
         self.origin = config['torrserver'].rstrip('/')
         parsed = urlsplit(self.origin)
         if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.path:
@@ -122,7 +127,7 @@ class Companion:
         self.opener = build_opener(ProxyHandler({}), NoRedirect())
         self.max_bytes = int(config.get('max_cache_bytes', 64 * 1024**3))
         self.reserve = int(config.get('min_free_bytes', 10 * 1024**3))
-        self.ttl = float(config.get('retention_seconds', 7 * 86400))
+        self.ttl = float(config.get('retention_seconds', 14 * 86400))
         self.lease = float(config.get('lease_seconds', 120))
         if self.max_bytes <= 0 or self.reserve < 0 or self.ttl <= 0 or self.lease <= 0:
             raise ValueError('Invalid cache limits')
@@ -228,11 +233,13 @@ class Companion:
             torrent = self.state.setdefault(torrent_hash, {'last_use': now, 'expired': False, 'files': []})
             torrent['last_use'] = now
             torrent['expired'] = False
-            torrent['current'] = index
             if event == 'end':
                 self.sessions.pop(client, None)
             else:
                 self.sessions[client] = (torrent_hash, index, now)
+            # A late end event from another player must not move the window back.
+            if event != 'end' or not self.active(torrent_hash):
+                torrent['current'] = index
             # Keep progress even when metadata retrieval is still pending.
             progress = torrent.setdefault('progress', {})
             previous = progress.get(str(index), {})
@@ -269,8 +276,59 @@ class Companion:
 
     def active(self, torrent_hash):
         now = self.clock()
-        return (self.readers.get(torrent_hash, 0) > 0 or any(
+        return (any(h == torrent_hash and count > 0 for (h, _), count in self.readers.items()) or any(
             h == torrent_hash and now - stamp < self.lease for h, _, stamp in self.sessions.values()))
+
+    def episode_window(self, torrent):
+        """Natural playlist order, not torrent IDs; sidecars do not count as episodes."""
+        videos = sorted((f for f in torrent.get('files', [])
+                         if f['path'].rsplit('.', 1)[-1].lower() in VIDEO),
+                        key=lambda f: natural_key(f['path']))
+        current = torrent.get('current')
+        if current is None and videos:
+            current = videos[0]['id']
+        position = next((i for i, f in enumerate(videos) if f['id'] == current), None)
+        if position is None:
+            return [], []  # Unknown metadata/current file: never guess what to delete.
+        kept = videos[max(0, position - self.keep_previous):position + self.download_ahead + 1]
+        # Playing episode first, next episodes, then the retained previous episode(s).
+        priority = (videos[position:position + self.download_ahead + 1]
+                    + videos[max(0, position - self.keep_previous):position])
+        groups = {f['id']: [f] for f in videos}
+        shared = []
+        for file in torrent.get('files', []):
+            if file in videos:
+                continue
+            owners = [v for v in videos if file['path'].startswith(v['path'].rsplit('.', 1)[0] + '.')]
+            if owners:
+                for owner in owners:
+                    groups[owner['id']].append(file)
+            else:
+                shared.append(file)
+        allowed = {f['id'] for v in kept for f in groups[v['id']]}
+        ordered = []
+        for file in [f for v in priority for f in groups[v['id']]] + shared:
+            if file not in ordered:
+                ordered.append(file)
+        outside = [f for v in videos for f in groups[v['id']] if f['id'] not in allowed]
+        return ordered, outside
+
+    def file_active(self, torrent_hash, index):
+        now = self.clock()
+        file = next(f for f in self.state[torrent_hash]['files'] if f['id'] == index)
+        owners = {v['id'] for v in self.state[torrent_hash]['files']
+                  if v['path'].rsplit('.', 1)[-1].lower() in VIDEO
+                  and file['path'].startswith(v['path'].rsplit('.', 1)[0] + '.')}
+        owners.add(index)
+        return (any(self.readers.get((torrent_hash, i), 0) > 0 for i in owners) or any(
+            h == torrent_hash and i in owners and now - stamp < self.lease
+            for h, i, stamp in self.sessions.values()))
+
+    def download_allowed(self, torrent_hash, file):
+        torrent = self.state[torrent_hash]
+        return (self.download_enabled and not (self.cleanup_expired and (
+            torrent.get('expired') or self.clock() - torrent['last_use'] >= self.ttl))
+            and any(f['id'] == file['id'] for f in self.episode_window(torrent)[0]))
 
     def usage(self):
         return sum(p.stat().st_size for parent in self.root.iterdir()
@@ -287,13 +345,15 @@ class Companion:
             removed = []
             changed = False
             for torrent_hash, torrent in self.state.items():
-                if self.active(torrent_hash):
-                    continue
-                expired = self.cleanup_expired and self.clock() - torrent['last_use'] >= self.ttl
+                expired = (self.cleanup_expired and not self.active(torrent_hash)
+                           and self.clock() - torrent['last_use'] >= self.ttl)
+                outside = set()
+                if self.cleanup_watched and torrent.get('current') is not None:
+                    outside = {f['id'] for f in self.episode_window(torrent)[1]}
                 for file in torrent.get('files', []):
-                    if self.downloading == (torrent_hash, file['id']):
+                    if self.downloading == (torrent_hash, file['id']) or self.file_active(torrent_hash, file['id']):
                         continue
-                    if expired or (self.cleanup_watched and self.watched(torrent, file)):
+                    if expired or file['id'] in outside:
                         target = self.path(torrent_hash, file['id'])
                         if target.exists():
                             target.unlink()
@@ -315,11 +375,9 @@ class Companion:
                 if self.cleanup_expired and (torrent.get('expired')
                         or self.clock() - torrent['last_use'] >= self.ttl):
                     continue
-                files = torrent.get('files', [])
-                # Download the playing file first, then remaining unwatched files.
-                files = sorted(files, key=lambda f: f['id'] != torrent.get('current'))
+                files = self.episode_window(torrent)[0]
                 for file in files:
-                    if not self.watched(torrent, file) and self.available(torrent_hash, file) < file['length']:
+                    if self.available(torrent_hash, file) < file['length']:
                         return torrent_hash, file
 
     def open_range(self, url, start, end):
@@ -332,19 +390,16 @@ class Companion:
         return response
 
     def download_one(self, torrent_hash, file):
-        if not self.download_enabled:
-            return
         with self.lock:
+            if not self.download_allowed(torrent_hash, file):
+                return
             self.downloading = (torrent_hash, file['id'])
         try:
             position = self.available(torrent_hash, file)
             while position < file['length'] and not self.stopping.is_set():
                 self.cleanup()
                 with self.lock:
-                    torrent = self.state[torrent_hash]
-                    if (not self.download_enabled or self.watched(torrent, file)
-                            or (self.cleanup_expired and (torrent.get('expired')
-                                or self.clock() - torrent['last_use'] >= self.ttl))):
+                    if not self.download_allowed(torrent_hash, file):
                         break
                     count = min(4 * 1024**2, file['length'] - position)
                     if self.usage() + count > self.max_bytes or shutil.disk_usage(self.root).free - count < self.reserve:
@@ -356,7 +411,7 @@ class Companion:
                     if len(data) != count:
                         raise IOError('Truncated upstream response')
                 with self.lock:
-                    if self.watched(self.state[torrent_hash], file) or self.stopping.is_set():
+                    if not self.download_allowed(torrent_hash, file) or self.stopping.is_set():
                         break
                     target = self.path(torrent_hash, file['id'], create=True)
                     fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
@@ -402,12 +457,13 @@ class Companion:
                 files = [{'id': f['id'], 'path': f['path'], 'length': f['length'],
                           'cached': self.available(torrent_hash, f), 'watched': self.watched(torrent, f)}
                          for f in torrent.get('files', [])]
-                torrents.append({'hash': torrent_hash, 'active': self.active(torrent_hash),
+                torrents.append({'hash': torrent_hash, 'active': self.active(torrent_hash), 'current': torrent.get('current'),
                                  'expired': torrent.get('expired', False), 'files': files,
                                  'pending_progress': sum(bool(p.get('pending')) for p in torrent.get('progress', {}).values())})
             return {'cache_bytes': self.usage(), 'max_cache_bytes': self.max_bytes,
                     'features': {name: getattr(self, name) for name in
                                  ('download_enabled', 'cleanup_watched', 'cleanup_expired')},
+                    'download_ahead': self.download_ahead, 'keep_previous': self.keep_previous,
                     'retention_seconds': self.ttl, 'downloading': self.downloading, 'torrents': torrents}
 
 
@@ -500,7 +556,8 @@ class Handler(BaseHTTPRequestHandler):
         with companion.lock:
             torrent['last_use'] = companion.clock()
             torrent['expired'] = False
-            companion.readers[torrent_hash] = companion.readers.get(torrent_hash, 0) + 1
+            key = (torrent_hash, index)
+            companion.readers[key] = companion.readers.get(key, 0) + 1
         try:
             with contextlib.ExitStack() as resources:
                 position = start
@@ -540,7 +597,7 @@ class Handler(BaseHTTPRequestHandler):
                     position += len(data)
         finally:
             with companion.lock:
-                companion.readers[torrent_hash] -= 1
+                companion.readers[key] -= 1
             companion.wake.set()
 
 
@@ -570,10 +627,11 @@ def install(args):
     if not config_path.exists():
         config = {'torrserver': args.server, 'bind': args.bind, 'port': args.port,
                   'download_enabled': False, 'cleanup_watched': False, 'cleanup_expired': False,
+                  'download_ahead': 3, 'keep_previous': 1,
                   'token': secrets.token_urlsafe(32),
                   'cache_dir': str(home / 'Library/Caches/iina-torrserver'),
                   'max_cache_bytes': 64 * 1024**3, 'min_free_bytes': 10 * 1024**3,
-                  'retention_seconds': 604800, 'lease_seconds': 120}
+                  'retention_seconds': 1209600, 'lease_seconds': 120}
         config_path.write_text(json.dumps(config, indent=2) + '\n')
         config_path.chmod(0o600)
     config = json.loads(config_path.read_text())

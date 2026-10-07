@@ -1,5 +1,6 @@
 """Deterministic cache/HTTP tests; no real downloads or production viewed records."""
 import importlib.util
+import io
 import json
 import subprocess
 import sys
@@ -87,7 +88,7 @@ class Tests(unittest.TestCase):
                        'download_enabled': True, 'cleanup_watched': True, 'cleanup_expired': True,
                        'cache_dir': self.temp.name + '/cache', 'token': TOKEN,
                        'min_free_bytes': 0, 'max_cache_bytes': 10000000,
-                       'retention_seconds': 604800, 'lease_seconds': 120}
+                       'retention_seconds': 1209600, 'lease_seconds': 120}
         self.cache = module.Companion(self.config, clock=lambda: self.now[0])
         self.upstream.play_requests = self.upstream.dav_requests = 0
         self.upstream.viewed = {}
@@ -123,7 +124,95 @@ class Tests(unittest.TestCase):
         target.write_bytes(DATA[index] if count is None else DATA[index][:count])
         return target
 
-    def test_download_all_files_without_viewed_side_effect(self):
+    def add_third_episode(self):
+        self.catalog['files'].append({'id': 4, 'path': 'Season/S01E3.mkv',
+                                     'length': 1, 'dav': '/dav/fixture/E3'})
+
+    def rolling_catalog(self):
+        # Non-contiguous IDs deliberately disagree with episode order.
+        ids = [90, 5, 44, 3, 71, 9, 21, 80]
+        self.catalog['files'] = [{'id': i, 'path': 'Season/S01E%d.mkv' % n,
+                                 'length': 1, 'dav': '/dav/fixture/E%d' % n}
+                                for n, i in zip([1, 2, 3, 4, 5, 6, 7, 10], ids)][::-1]
+        return ids
+
+    def test_three_ahead_natural_order_and_old_unwatched_cleanup(self):
+        ids = self.rolling_catalog()
+        self.event(index=ids[2])
+        self.now[0] += 121
+        for file in self.catalog['files']:
+            self.cache.path(HASH, file['id'], create=True).write_bytes(b'x')
+        removed = self.cache.cleanup()
+        self.assertEqual({i for _, i in removed}, {ids[0], ids[6], ids[7]})
+        for i in ids[1:6]:
+            self.assertTrue(self.cache.path(HASH, i).exists())
+        self.assertIsNone(self.cache.choose_download())
+        for i in ids[1:6]:
+            self.cache.path(HASH, i).unlink()
+        chosen = []
+        while self.cache.choose_download():
+            _, file = self.cache.choose_download()
+            chosen.append(file['id'])
+            with patch.object(self.cache, 'open_range', return_value=io.BytesIO(b'x')):
+                self.cache.download_one(HASH, file)
+        self.assertEqual(chosen, ids[2:6] + ids[1:2])
+
+    def test_switch_cleans_older_episodes_during_active_playback(self):
+        ids = self.rolling_catalog()
+        self.now[0] += 121
+        for file in self.catalog['files']:
+            self.cache.path(HASH, file['id'], create=True).write_bytes(b'x')
+        self.event(index=ids[3])
+        self.assertTrue(self.cache.active(HASH))
+        removed = self.cache.cleanup()
+        self.assertEqual({i for _, i in removed}, {ids[0], ids[1], ids[7]})
+        self.assertTrue(self.cache.path(HASH, ids[2]).exists())
+        # Going back shifts the window and permits re-fetching evicted episodes.
+        self.event(index=ids[1])
+        self.assertEqual(self.cache.choose_download()[1]['id'], ids[1])
+        allowed, _ = self.cache.episode_window(self.catalog)
+        self.assertEqual({f['id'] for f in allowed}, set(ids[:5]))
+
+    def test_inflight_chunk_outside_new_window_is_not_written(self):
+        ids = self.rolling_catalog()
+        self.event(index=ids[4])
+        file = next(f for f in self.catalog['files'] if f['id'] == ids[7])
+        def switched(*_):
+            self.event(index=ids[0])
+            return io.BytesIO(b'x')
+        with patch.object(self.cache, 'open_range', side_effect=switched):
+            self.cache.download_one(HASH, file)
+        self.assertEqual(self.cache.available(HASH, file), 0)
+        self.assertIsNone(self.cache.downloading)
+        # An explicit attempt outside the window cannot bypass the scheduler.
+        with patch.object(self.cache, 'open_range') as fetch:
+            self.cache.download_one(HASH, file)
+            fetch.assert_not_called()
+
+    def test_window_counts_video_not_sidecars_and_is_configurable(self):
+        ids = self.rolling_catalog()
+        self.catalog['files'].append({'id': 101, 'path': 'Season/S01E5.rus.srt',
+                                     'length': 1, 'dav': '/dav/subtitle'})
+        self.event(index=ids[1])
+        allowed, _ = self.cache.episode_window(self.catalog)
+        self.assertEqual({f['id'] for f in allowed}, set(ids[:5]) | {101})
+        self.cache.download_ahead = 0
+        self.cache.keep_previous = 0
+        allowed, _ = self.cache.episode_window(self.catalog)
+        self.assertEqual([f['id'] for f in allowed], [ids[1]])
+        for name in ('download_ahead', 'keep_previous'):
+            for value in (-1, True, 1.5, '3', None):
+                with self.assertRaisesRegex(ValueError, name):
+                    module.Companion(dict(self.config, **{name: value}))
+
+    def test_unknown_current_does_not_guess_cleanup_or_download(self):
+        self.fill()
+        self.catalog['current'] = 999
+        self.now[0] += 121
+        self.assertEqual(self.cache.cleanup(), [])
+        self.assertIsNone(self.cache.choose_download())
+
+    def test_download_window_files_without_viewed_side_effect(self):
         while True:
             task = self.cache.choose_download()
             if not task:
@@ -138,7 +227,7 @@ class Tests(unittest.TestCase):
     def test_missing_and_explicit_false_flags_preserve_existing_cache(self):
         self.fill(count=13000)
         self.event('end', position=100)
-        self.now[0] += 604801
+        self.now[0] += 1209601
         for explicit in (False, True):
             config = {k: v for k, v in self.config.items() if k not in
                       ('download_enabled', 'cleanup_watched', 'cleanup_expired')}
@@ -156,30 +245,32 @@ class Tests(unittest.TestCase):
             self.assertFalse(any(restarted.status()['features'].values()))
 
     def test_cleanup_rules_are_independent(self):
+        self.add_third_episode()
         first = self.fill()
         second = self.fill(index=2)
-        self.event('end', position=95)
-        self.now[0] += 604801
+        self.event(index=4)
+        self.now[0] += 1209601
         self.cache.cleanup_expired = False
         self.assertEqual(self.cache.cleanup(), [(HASH, 1)])
         self.assertTrue(second.exists())
         self.assertIsNotNone(self.cache.choose_download())
         self.assertFalse(self.catalog['expired'])
-        # Watched files remain when only age-based cleanup is enabled.
+        # Turning off rolling cleanup leaves old episodes until expiry.
         first = self.fill()
         self.cache.cleanup_watched = False
         self.cache.cleanup_expired = True
         self.catalog['last_use'] = self.now[0]
         self.assertEqual(self.cache.cleanup(), [])
-        self.now[0] += 604800
+        self.now[0] += 1209600
         removed = self.cache.cleanup()
         self.assertIn((HASH, 1), removed)
         self.assertIn((HASH, 2), removed)
         self.assertFalse(first.exists() or second.exists())
 
     def test_disabled_download_keeps_explicit_cleanup_working(self):
+        self.add_third_episode()
         target = self.fill()
-        self.event('end', position=95)
+        self.event(index=4)
         self.now[0] += 121
         self.cache.download_enabled = False
         self.assertIsNone(self.cache.choose_download())
@@ -205,6 +296,9 @@ class Tests(unittest.TestCase):
         path = home / 'Library/Application Support/iina-torrserver/companion.json'
         config = json.loads(path.read_text())
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(config['download_ahead'], 3)
+        self.assertEqual(config['keep_previous'], 1)
+        self.assertEqual(config['retention_seconds'], 1209600)
         for name in ('download_enabled', 'cleanup_watched', 'cleanup_expired'):
             self.assertIs(config[name], False)
 
@@ -246,27 +340,31 @@ class Tests(unittest.TestCase):
                 self.request('/media/' + HASH + '/1/movie.mkv', headers={'Range': value})
             self.assertEqual(raised.exception.code, 416)
 
-    def test_95_percent_only_after_player_stops(self):
+    def test_watched_current_and_previous_survive_stop_and_restart(self):
+        self.add_third_episode()
         target = self.fill()
-        self.event(position=94.99)
-        self.now[0] += 121
-        self.assertEqual(self.cache.cleanup(), [])
-        self.event(position=95)
-        self.assertEqual(self.cache.cleanup(), [])
-        self.assertTrue(target.exists())
         self.event('end', position=95)
+        self.now[0] += 121
+        self.assertTrue(self.cache.watched(self.catalog, self.first))
+        self.assertEqual(self.cache.cleanup(), [])
+        self.event(index=2)
+        self.assertEqual(self.cache.cleanup(), [])
+        self.event('end', index=2)
+        restarted = module.Companion(self.config, clock=lambda: self.now[0] - 121)
+        self.assertEqual(restarted.cleanup(), [])
+        self.assertTrue(target.exists())
+        self.event(index=4)
         self.assertEqual(self.cache.cleanup(), [(HASH, 1)])
         self.assertFalse(target.exists())
-        self.assertNotEqual(self.cache.choose_download()[1]['id'], 1)
 
     def test_eof_and_progress_survive_restart(self):
         self.event('end', position=100)
         restarted = module.Companion(self.config, clock=lambda: self.now[0])
         self.assertTrue(restarted.watched(restarted.state[HASH], self.first))
 
-    def test_week_expiry_does_not_refill_until_new_use(self):
+    def test_two_week_expiry_does_not_refill_until_new_use(self):
         target = self.fill()
-        self.now[0] += 604799
+        self.now[0] += 1209599
         self.assertEqual(self.cache.cleanup(), [])
         self.now[0] += 1
         self.assertEqual(self.cache.cleanup(), [(HASH, 1)])
@@ -277,36 +375,39 @@ class Tests(unittest.TestCase):
 
     def test_pause_heartbeat_renews_retention(self):
         self.fill()
-        self.now[0] += 604790
+        self.now[0] += 1209590
         self.event(position=10)
-        self.now[0] += 604790
+        self.now[0] += 1209590
         self.assertEqual(self.cache.cleanup(), [])
 
     def test_cleanup_protects_http_reader_and_downloader(self):
+        self.add_third_episode()
         self.fill()
-        self.event('end', position=100)
+        self.event(index=4)
         self.now[0] += 121
-        self.cache.readers[HASH] = 1
+        self.cache.readers[(HASH, 1)] = 1
         self.assertEqual(self.cache.cleanup(), [])
-        self.cache.readers[HASH] = 0
+        self.cache.readers[(HASH, 1)] = 0
         self.cache.downloading = (HASH, 1)
         self.assertEqual(self.cache.cleanup(), [])
         self.cache.downloading = None
         self.assertEqual(self.cache.cleanup(), [(HASH, 1)])
 
     def test_second_player_prevents_cleanup(self):
+        self.add_third_episode()
         self.fill()
-        self.event(position=100, client='one')
-        self.event(index=2, client='two')
-        self.event('end', position=100, client='one')
-        self.now[0] += 119
+        self.now[0] += 121
+        self.event(client='one')
+        self.event(index=4, client='two')
         self.assertEqual(self.cache.cleanup(), [])
-        self.now[0] += 2
+        self.event('end', client='one')
+        self.assertEqual(self.catalog['current'], 4)
         self.assertEqual(self.cache.cleanup(), [(HASH, 1)])
 
     def test_restart_grace_prevents_deleting_paused_player_cache(self):
+        self.add_third_episode()
         self.fill()
-        self.event('end', position=100)
+        self.event('end', index=4)
         self.now[0] += 121
         restarted = module.Companion(self.config, clock=lambda: self.now[0])
         self.assertEqual(restarted.cleanup(), [])
@@ -413,15 +514,18 @@ class Tests(unittest.TestCase):
         self.assertEqual(progress['position'], 95)
 
     def test_related_subtitles_follow_their_episode_only(self):
+        self.add_third_episode()
         for index in (1, 2, 3):
             self.fill(index)
-        self.event('end', position=100)
+        self.event(index=4)
         self.now[0] += 121
         self.assertEqual(self.cache.cleanup(), [(HASH, 1)])
+        self.assertTrue(self.cache.path(HASH, 2).exists())
         self.assertTrue(self.cache.path(HASH, 3).exists())
-        self.event('end', index=2, position=95)
+        self.catalog['files'].append({'id': 5, 'path': 'Season/S01E4.mkv',
+                                     'length': 1, 'dav': '/dav/fixture/E4'})
+        self.event(index=5)
         self.assertEqual(set(self.cache.cleanup()), {(HASH, 2), (HASH, 3)})
-        self.assertIsNone(self.cache.choose_download())
 
     def test_service_singleton_and_clean_restart(self):
         config = dict(self.config, cache_dir=self.temp.name + '/service-cache', bind='127.0.0.1', port=0)

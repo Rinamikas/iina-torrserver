@@ -197,12 +197,13 @@ def main():
             assert not cache.cleanup(), 'Active playback was cleaned'
             cache.event({'hash': torrent_hash, 'index': first['id'], 'client': 'test',
                          'event': 'end', 'position': 95, 'duration': 100})
-            assert cache.cleanup() == [(torrent_hash, first['id'])]
+            assert cache.cleanup() == []
+            assert cache.path(torrent_hash, first['id']).exists()
             assert len(api('/torrents', {'action': 'list'})) >= 1
-            now[0] += 604800
+            now[0] += 1209600
             cache.cleanup()
             assert cache.usage() == 0 and cache.choose_download() is None
-            print('PASS: 95% cleanup deferred until stop; week expiry does not refill', flush=True)
+            print('PASS: 95% history keeps current cache; two-week expiry does not refill', flush=True)
         finally:
             print('Seeder diagnostics: announces=%d connections=%d blocks=%d' %
                   (tracker.announces, peer.connections, peer.blocks), flush=True)
